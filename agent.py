@@ -32,10 +32,8 @@ class PlannerAgent:
             
             genai.configure(api_key=api_key)
             self.llm_service = genai.GenerativeModel('models/gemini-2.5-flash')
-            print("Gemini API configured successfully.")
 
         except Exception as e:
-            print(f"Error configuring the Gemini API: {e}")
             self.llm_service = None
 
     def no_op(self):
@@ -44,6 +42,7 @@ class PlannerAgent:
     def _fetch_models(self):
         bearer_token = os.environ.get("BEARER_TOKEN")
         if not bearer_token:
+            print("DEBUG: BEARER_TOKEN is not set. Cannot fetch models.")
             return
 
         try:
@@ -51,17 +50,49 @@ class PlannerAgent:
             headers = {"Authorization": f"Bearer {bearer_token}"}
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req) as response:
+                print(f"DEBUG: API Response Status: {response.status}")
                 if response.status == 200:
                     api_response = json.loads(response.read().decode())
+                    print(f"DEBUG: API Response: {json.dumps(api_response, indent=2)}")
                     self.available_models = api_response.get('data', [])
                     self.available_models = self.available_models[:10]
+                    print(f"DEBUG: available_models: {self.available_models}") # Added debug print
+                    if not self.available_models:
+                        print("DEBUG: 'data' key in API response is empty or not found.")
+                else:
+                    print(f"DEBUG: Error fetching models: {response.status} - {response.reason}")
         except Exception as e:
-            pass
+            print(f"DEBUG: An error occurred while fetching models: {e}")
 
     def fetch_and_select_model(self):
         if not self.available_models:
-            return None
-        return self.available_models
+            self._fetch_models()
+        if not self.available_models:
+            return "No models available."
+        return [model['modelName'] for model in self.available_models]
+
+    def select_model(self, model_name):
+        if not self.available_models:
+            self._fetch_models()
+
+        try:
+            model_names = [model['modelName'] for model in self.available_models]
+        except KeyError:
+            print("Error: The 'name' key was not found in one of the model objects.")
+            print(f"Available models: {self.available_models}")
+            return "An internal error occurred while selecting the model."
+
+        if model_name in model_names:
+            self.plan_details['model_name'] = model_name
+            self.selected_model = next((model for model in self.available_models if model['modelName'] == model_name), None)
+            return f"Model '{model_name}' has been selected."
+
+        similar_models = difflib.get_close_matches(model_name, model_names, n=5)
+
+        if similar_models:
+            return f"Model '{model_name}' not found. Did you mean one of these? {', '.join(similar_models)}"
+        else:
+            return f"Model '{model_name}' not found. No similar models were found either. Please choose from the available models."
 
     def prompt_for_constraint(self):
         return self.VALID_CONSTRAINTS
@@ -87,7 +118,6 @@ class PlannerAgent:
             base_start_date = datetime.strptime(base_start_str, '%Y-%m-%d')
             base_end_date = datetime.strptime(base_end_str, '%Y-%m-%d')
             
-            # Calculate the number of months in the base period
             base_months = (base_end_date.year - base_start_date.year) * 12 + (base_end_date.month - base_start_date.month) + 1
             
             if forecast_months != base_months:
@@ -167,114 +197,18 @@ class PlannerAgent:
             response = self.llm_service.generate_content(llm_prompt)
             standardized_period = response.text.strip()
 
-            # Use regex to extract only the date range
             match = re.search(r"\d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}", standardized_period)
             if match:
                 self.plan_details['base_period'] = match.group(0)
                 return match.group(0)
             else:
-                self.plan_details['base_period'] = standardized_period # Fallback to the full response
+                self.plan_details['base_period'] = standardized_period
                 return standardized_period
 
 
         except Exception as e:
-            self.plan_details['base_period'] = None # Invalidate it
+            self.plan_details['base_period'] = None
             return None
-
-    def _send_llm_request(self, user_prompt):
-        if not self.llm_service:
-            return "LLM service is not available."
-
-        self.chat_history.append({"role": "user", "content": user_prompt})
-
-        # Define the functions the LLM can call
-        function_definitions = [
-            {
-                "name": "fetch_and_select_model",
-                "description": "Fetches the available models and prompts the user to select one.",
-                "parameters": []
-            },
-            {
-                "name": "prompt_for_constraint",
-                "description": "Prompts the user to select a constraint.",
-                "parameters": []
-            },
-            {
-                "name": "standardize_forecast_period",
-                "description": "Standardizes the forecast period to a valid format.",
-                "parameters": [
-                    {"name": "period_string", "type": "string", "description": "The forecast period to standardize."}
-                ]
-            },
-            {
-                "name": "standardize_base_period",
-                "description": "Standardizes the base period to a date range format.",
-                "parameters": [
-                    {"name": "period_string", "type": "string", "description": "The base period to standardize."}
-                ]
-            },
-            {
-                "name": "_calculate_default_base_period",
-                "description": "Calculates the default base period.",
-                "parameters": []
-            },
-            {
-                "name": "validate_periods",
-                "description": "Validates that the forecast and base periods have the same duration.",
-                "parameters": []
-            }
-        ]
-
-        # Construct the prompt
-        full_prompt = f"""You are a marketing planner assistant. Your goal is to help the user create a marketing plan by gathering the necessary information.
-
-        Here is the current state of the plan:
-        {json.dumps(self.plan_details, indent=2)}
-
-        Here is the conversation history:
-        {json.dumps(self.chat_history, indent=2)}
-
-        Here are the functions you can call:
-        {json.dumps(function_definitions, indent=2)}
-
-        Please analyze the user's latest prompt and the conversation history to understand their request. Based on this, you should either:
-        1. Call one of the provided functions with the appropriate arguments.
-        2. Ask for more information from the user in a friendly and conversational way. If you are asking for information, please list the missing information in your response.
-        3. If all the information is gathered, confirm with the user and present a summary of the plan.
-
-        Your response should be a JSON object with three keys:
-        - "function_to_call": The name of the function to call, or null if you are asking a question.
-        - "arguments": A JSON object with the arguments for the function, or null.
-        - "response_to_user": A user-friendly, natural language response to the user.
-
-        User's latest prompt: "{user_prompt}"
-        """
-
-        try:
-            response = self.llm_service.generate_content(full_prompt)
-            cleaned_json = response.text.strip().replace('```json', '').replace('```', '').strip()
-            llm_response = json.loads(cleaned_json)
-
-            response_to_user = llm_response.get("response_to_user", "I'm sorry, I didn't understand that. Could you please rephrase?")
-            self.chat_history.append({"role": "agent", "content": response_to_user})
-
-            function_to_call = llm_response.get("function_to_call")
-            arguments = llm_response.get("arguments")
-
-            if function_to_call:
-                if hasattr(self, function_to_call):
-                    if arguments:
-                        getattr(self, function_to_call)(**arguments)
-                    else:
-                        getattr(self, function_to_call)()
-                else:
-                    print(f"Function {function_to_call} not found.")
-
-            return response_to_user
-
-        except Exception as e:
-            print(f"An error occurred while processing the LLM response: {e}")
-            return "I'm sorry, I encountered an error. Please try again."
 
     def _calculate_default_base_period(self):
         if not self.selected_model or not self.plan_details.get('forecast_period'):
@@ -302,7 +236,6 @@ class PlannerAgent:
         if not forecast_months:
             return None
 
-        # Calculate base_period_start_date
         start_month = model_start_date.month + 1
         start_year = model_start_date.year - 1
         if start_month > 12:
@@ -311,7 +244,6 @@ class PlannerAgent:
         
         base_period_start_date = date(start_year, start_month, 1)
 
-        # Calculate base_period_end_date
         end_month = base_period_start_date.month + forecast_months - 1
         end_year = base_period_start_date.year
         if end_month > 12:
@@ -323,51 +255,24 @@ class PlannerAgent:
 
         return f"{base_period_start_date.strftime('%Y-%m-%d')} to {base_period_end_date.strftime('%Y-%m-%d')}"
 
-    def validate_periods(self):
-        forecast_period = self.plan_details.get('forecast_period')
-        base_period = self.plan_details.get('base_period')
-
-        if not forecast_period or not base_period:
-            return False
-
-        forecast_period_months = {
-            "month": 1, "2 month": 2, "quarter": 3,
-            "6 month": 6, "9 month": 9, "year": 12
-        }
-        
-        forecast_months = forecast_period_months.get(forecast_period)
-        if not forecast_months:
-            return False
-
-        try:
-            base_start_str, base_end_str = base_period.split(' to ')
-            base_start_date = datetime.strptime(base_start_str, '%Y-%m-%d')
-            base_end_date = datetime.strptime(base_end_str, '%Y-%m-%d')
-            
-            # Calculate the number of months in the base period
-            base_months = (base_end_date.year - base_start_date.year) * 12 + (base_end_date.month - base_start_date.month) + 1
-            
-            if forecast_months != base_months:
-                return False
-            return True
-        except ValueError:
-            return False
-
-    def no_op(self):
-        pass
-
     def _send_llm_request(self, user_prompt):
         if not self.llm_service:
             return "LLM service is not available."
 
         self.chat_history.append({"role": "user", "content": user_prompt})
 
-        # Define the functions the LLM can call
         function_definitions = [
             {
                 "name": "fetch_and_select_model",
                 "description": "Fetches the available models and prompts the user to select one. Call this function if the user provides a placeholder model name like 'test model'.",
                 "parameters": []
+            },
+            {
+                "name": "select_model",
+                "description": "Selects a model and suggests similar models if the given model is not found.",
+                "parameters": [
+                    {"name": "model_name", "type": "string", "description": "The name of the model to select."}
+                ]
             },
             {
                 "name": "prompt_for_constraint",
@@ -405,7 +310,6 @@ class PlannerAgent:
             }
         ]
 
-        # Construct the prompt
         full_prompt = f"""You are a marketing planner assistant. Your goal is to help the user create a marketing plan by gathering the necessary information in a conversational way.
 
         Here is the current state of the plan:
@@ -464,24 +368,3 @@ class PlannerAgent:
         except Exception as e:
             print(f"An error occurred while processing the LLM response: {e}")
             return "I'm sorry, I encountered an error. Please try again."
-
-
-    def run(self):
-        if not self.llm_service:
-            return
-
-        self._fetch_models()
-
-        print("\nHello! I am your marketing planner assistant. How can I help you today?")
-        
-        while True:
-            user_input = input("> ")
-            if user_input.lower() == 'exit':
-                break
-
-            response = self._send_llm_request(user_input)
-            print(f"Agent: {response}")
-
-if __name__ == '__main__':
-    agent = PlannerAgent()
-    agent.run()
