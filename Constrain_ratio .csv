@@ -1,0 +1,5 @@
+constrain,lower limit,upperlimit
+current,0.95,1.05
+Conservative,0.75,1.5
+Moderate,0.5,2
+Aggressive,0.1,4.99
