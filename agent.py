@@ -42,7 +42,6 @@ class PlannerAgent:
     def _fetch_models(self):
         bearer_token = os.environ.get("BEARER_TOKEN")
         if not bearer_token:
-            print("DEBUG: BEARER_TOKEN is not set. Cannot fetch models.")
             return
 
         try:
@@ -50,19 +49,12 @@ class PlannerAgent:
             headers = {"Authorization": f"Bearer {bearer_token}"}
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req) as response:
-                print(f"DEBUG: API Response Status: {response.status}")
                 if response.status == 200:
                     api_response = json.loads(response.read().decode())
-                    print(f"DEBUG: API Response: {json.dumps(api_response, indent=2)}")
                     self.available_models = api_response.get('data', [])
                     self.available_models = self.available_models[:10]
-                    print(f"DEBUG: available_models: {self.available_models}") # Added debug print
-                    if not self.available_models:
-                        print("DEBUG: 'data' key in API response is empty or not found.")
-                else:
-                    print(f"DEBUG: Error fetching models: {response.status} - {response.reason}")
         except Exception as e:
-            print(f"DEBUG: An error occurred while fetching models: {e}")
+            pass
 
     def fetch_and_select_model(self):
         if not self.available_models:
@@ -324,10 +316,11 @@ class PlannerAgent:
         Please analyze the user's latest prompt and the entire conversation history to understand their request. Based on this, you should either:
         1. Call one of the provided functions with the appropriate arguments. Do not call a function if it has already been called successfully for the same purpose.
         2. Ask for more information from the user in a friendly and conversational way. Be direct and ask for all missing information at once. Do not ask for confirmation at every step.
-        3. When asking for a constraint, you must present the user with the following options: {self.VALID_CONSTRAINTS}
-        4. When asking for a forecast period, you can use the following as examples: {self.VALID_FORECAST_PERIODS}
-        5. If the `validate_periods` function returns `False`, you must ask the user to update the base period to match the duration of the forecast period.
-        6. If all the information is gathered (i.e., no values in `plan_details` are null), confirm with the user and present a detailed summary of the plan.
+        3. calculate the default value for baseperiod by calling _calculate_default_base_period function if baseperiod not specified by the user and ask the user if they want to keep it or change it if the want to chnage it tell them to enter the baseperiod and use that otherwie use the default value 
+        4. When asking for a constraint, you must present the user with the following options: {self.VALID_CONSTRAINTS}
+        5. When asking for a forecast period, you can use the following as examples: {self.VALID_FORECAST_PERIODS}
+        6. If the `validate_periods` function returns `False`, you must ask the user to update the base period to match the duration of the forecast period.
+        7. If all the information is gathered (i.e., no values in `plan_details` are null), confirm with the user and present a detailed summary of the plan.
 
         Your response should be a JSON object with three keys:
         - "function_to_call": The name of the function to call, or "no_op" if you are just responding to the user.
