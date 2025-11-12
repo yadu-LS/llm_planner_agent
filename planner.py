@@ -57,7 +57,7 @@ class PlannerAgent:
                     api_response = json.loads(response.read().decode())
 
                     self.available_models = api_response.get('data', [])
-                    self.available_models = self.available_models[:10]
+                    self.available_models = self.available_models[0:10]
                 else:
                     print(f"DEBUG: Error fetching models: {response.status} - {response.reason}")
         except Exception as e:
@@ -279,6 +279,33 @@ class PlannerAgent:
         else:
             return f"Invalid constraint. Please choose from: {', '.join(self.VALID_CONSTRAINTS)}"
 
+    def get_channels_for_calibration(self, sol_id, model_id):
+        bearer_token = os.environ.get("BEARER_TOKEN")
+        if not bearer_token:
+            return "BEARER_TOKEN is not set. Cannot fetch calibration data."
+
+        url = f"https://console-platform-stg.lifesight.io/mmm/model/attribute_quality_score?solId={sol_id}&modelId={model_id}"
+        headers = {"Authorization": f"Bearer {bearer_token}"}
+
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req) as response:
+                if response.status == 200:
+                    api_response = json.loads(response.read().decode())
+                    
+                    channels_to_calibrate = []
+                    spend_data = api_response.get('data', {}).get('channel_wise_attribute_info', {}).get('spend', [])
+
+                    for channel_info in spend_data:
+                        if channel_info.get('calibration') == 'YES':
+                            channels_to_calibrate.append(channel_info.get('attribute'))
+                    
+                    return channels_to_calibrate
+                else:
+                    return f"Error fetching calibration data: {response.status} - {response.reason}"
+        except Exception as e:
+            return f"An error occurred while fetching calibration data: {e}"
+
     def run_budget_optimizer(self):
         if not self.selected_model:
             return "Please select a model first."
@@ -286,6 +313,12 @@ class PlannerAgent:
         model_id = self.selected_model.get('id')
         if not model_id:
             return "Could not find the ID of the selected model."
+
+        sol_id = self.selected_model.get('solId')
+        if not sol_id:
+            return "Could not find the Solution ID of the selected model."
+
+        channels_for_calibration = self.get_channels_for_calibration(sol_id, model_id)
 
         refresh_details = self.selected_model.get('refreshDetails')[0]
         input_data_start_date = refresh_details.get('modelStart')
@@ -337,8 +370,7 @@ class PlannerAgent:
                     current_budget = all_platform_data.get('currentBudgetData', {}).get('spend', 0) if all_platform_data else 0
 
                     constraint = self.plan_details.get('constraint')
-                    lower_limit_ratio, upper_limit_ratio = 1.0, 1.0
-
+                    
                     constraint_ratios = {
                         "current": {"lower": 0.95, "upper": 1.05},
                         "conservative": {"lower": 0.75, "upper": 1.5},
@@ -346,10 +378,9 @@ class PlannerAgent:
                         "aggressive": {"lower": 0.1, "upper": 4.99}
                     }
 
-                    if constraint and constraint.lower() in constraint_ratios:
-                        ratios = constraint_ratios[constraint.lower()]
-                        lower_limit_ratio = ratios["lower"]
-                        upper_limit_ratio = ratios["upper"]
+                    ratios = constraint_ratios.get(constraint.lower(), {"lower": 1.0, "upper": 1.0})
+                    lower_limit_ratio = ratios["lower"]
+                    upper_limit_ratio = ratios["upper"]
                     
                     table_data = []
                     for channel_data in mmm_response_list:
@@ -358,8 +389,13 @@ class PlannerAgent:
                             continue
 
                         spend = channel_data.get('currentBudgetData', {}).get('spend', 0)
-                        lower_bound = spend * lower_limit_ratio
-                        upper_bound = spend * upper_limit_ratio
+
+                        if channel_name in channels_for_calibration:
+                            lower_bound = spend * 0.95
+                            upper_bound = spend * 1.05
+                        else:
+                            lower_bound = spend * lower_limit_ratio
+                            upper_bound = spend * upper_limit_ratio
 
                         table_data.append({
                             'Channel': channel_name,
@@ -375,7 +411,7 @@ class PlannerAgent:
 
                     response_str = f"CURRENT BUDGET: {current_budget}\n\n"
                     response_str += "| Channel | Spend | Lower Limit | Upper Limit |\n"
-                    response_str += "|---|---|---|---|"
+                    response_str += "|---|---|---|---|\n"
                     for row in table_data:
                         response_str += f"| {row['Channel']} | {row['Spend']} | {row['Lower Limit']:.2f} | {row['Upper Limit']:.2f} |\n"
 
@@ -456,6 +492,14 @@ class PlannerAgent:
                 ]
             },
             {
+                "name": "get_channels_for_calibration",
+                "description": "Fetches a list of channels that require calibration based on their attribute quality score.",
+                "parameters": [
+                    {"name": "sol_id", "type": "string", "description": "The solution ID (solId) for the model."},
+                    {"name": "model_id", "type": "string", "description": "The model ID (modelId) for the model."}
+                ]
+            },
+            {
                 "name": "no_op",
                 "description": "Do nothing and just respond to the user.",
                 "parameters": []
@@ -480,7 +524,9 @@ class PlannerAgent:
         4. When asking for a constraint, you must present the user with the following options: {self.VALID_CONSTRAINTS}
         5. When asking for a forecast period, you can use the following as examples: {self.VALID_FORECAST_PERIODS}
         6. If the `validate_periods` function returns `False`, you must ask the user to update the base period to match the duration of the forecast period.
-        7. If all the *required* information is gathered (i.e., `model_name`, `forecast_period`, `base_period`, and `constraint` are not null), confirm with the user and present a detailed summary of the plan. The `budget` is optional. After presenting the summary, call the `run_budget_optimizer` function. The `run_budget_optimizer` function will return a table including the current budget and ask the user if they want to update it. If the user expresses a desire to change or update the budget, you should call the `set_budget` function with the new budget amount provided by the user.
+        7. If all the *required* information is gathered (i.e., `model_name`, `forecast_period`,`base_period`, and `constraint` are not null), you MUST present a detailed summary of the plan to the user and ask for their confirmation to proceed. Your response should be a user-facing message, and you should call the `no_op` function.                               
+        8. ONLY after the user has confirmed the plan summary, your next action should be to call the `run_budget_optimizer` function. The `run_budget_optimizer` function will return a table including the current budget and ask the user if they want to update it. If the user expresses a desire to change or update the budget, you should call the `set_budget` function with the new budget amount provided by the user.
+
 
         Your response should be a JSON object with three keys:
         - "function_to_call": The name of the function to call, or "no_op" if you are just responding to the user.
@@ -498,8 +544,6 @@ class PlannerAgent:
             llm_response = json.loads(cleaned_json)
 
             response_to_user = llm_response.get("response_to_user", "I'm sorry, I didn't understand that. Could you please rephrase?")
-            self.chat_history.append({"role": "agent", "content": response_to_user})
-
             function_to_call = llm_response.get("function_to_call")
             arguments = llm_response.get("arguments")
 
@@ -513,9 +557,12 @@ class PlannerAgent:
                     
                     self.chat_history.append({"role": "function", "name": function_to_call, "content": str(function_result)})
 
+                    if function_to_call == 'run_budget_optimizer':
+                        response_to_user = str(function_result)
                 else:
                     print(f"Function {function_to_call} not found.")
 
+            self.chat_history.append({"role": "agent", "content": response_to_user})
             return response_to_user
 
         except Exception as e:
